@@ -15,6 +15,7 @@ import threading
 import shelve
 import uuid
 import urllib2
+import calendar
 
 from geopy.geocoders import GoogleV3
 from pgoapi import PGoApi
@@ -39,7 +40,7 @@ from .worker_result import WorkerResult
 from .tree_config_builder import ConfigException
 from .tree_config_builder import MismatchTaskApiVersion
 from .tree_config_builder import TreeConfigBuilder
-from .inventory import init_inventory, player
+from .inventory import init_inventory, player, Pokemons
 from sys import platform as _platform
 from pgoapi.protos.pogoprotos.enums import badge_type_pb2
 from pgoapi.exceptions import AuthException, NotLoggedInException, ServerSideRequestThrottlingException, ServerBusyOrOfflineException, NoPlayerPositionSetException, HashingOfflineException
@@ -140,9 +141,24 @@ class PokemonGoBot(object):
         self.inventory_refresh_counter = 0
         self.last_inventory_refresh = time.time()
         
+        # Time when inbox is called
+        self.get_inbox_time = 0
+        
         # Allow user to change hash service
         if self.config.hashendpoint:
             HashServer.endpoint = self.config.hashendpoint
+            
+        # Allow user to by pass warning without question
+        if self.config.bypass_warning:
+            self.bypass_warning = self.config.bypass_warning
+        else:
+            self.bypass_warning = False
+
+        # Allow user to use a proxy with the bot
+        if self.config.proxy:
+            self.proxy = self.config.proxy
+        else:
+            self.proxy = False
 
         # Catch on/off
         self.catch_disabled = False
@@ -161,7 +177,7 @@ class PokemonGoBot(object):
             self.config.client_id = str(uuid.uuid4())
             saved_info[key] = self.config.client_id
         saved_info.close()
-
+    
     def start(self, bot):
         self._setup_event_system(bot)
         self.sleep_schedule = SleepSchedule(self, self.config.sleep_schedule) if self.config.sleep_schedule else None
@@ -567,7 +583,8 @@ class PokemonGoBot(object):
         self.event_manager.register_event('show_best_pokemon', parameters=('pokemons'))
         self.event_manager.register_event('revived_pokemon')
         self.event_manager.register_event('healing_pokemon')
-
+        self.event_manager.register_event('shadowban_alert')
+        
         # level up stuff
         self.event_manager.register_event(
             'level_up',
@@ -743,6 +760,7 @@ class PokemonGoBot(object):
         )
         # database shit
         self.event_manager.register_event('catch_log')
+        self.event_manager.register_event('shadowban_log')
         self.event_manager.register_event('vanish_log')
         self.event_manager.register_event('evolve_log')
         self.event_manager.register_event('login_log')
@@ -993,6 +1011,30 @@ class PokemonGoBot(object):
                 self.api.set_position(*position)
                 self.login()
 
+    def yes_no(self,question,warn_type):
+        # raw_input returns the empty string for "enter"
+        yes = set(['yes','y', 'ye', ''])
+        no = set(['no','n'])
+        self.event_manager.emit(
+            warn_type,
+            sender=self,
+            level='info',
+            formatted=question
+        )
+        choice = raw_input().lower()
+        if choice in yes:
+           return True
+        elif choice in no:
+           return False
+        else:
+            self.event_manager.emit(
+                warn_type,
+                sender=self,
+                level='info',
+                formatted="Please respond with 'yes' or 'no'"
+            )
+            return None
+    
     def login(self):
         status = {}
         retry = 0
@@ -1007,21 +1049,6 @@ class PokemonGoBot(object):
         lat, lng = self.position[0:2]
         self.api.set_position(lat, lng, self.alt)  # or should the alt kept to zero?
 
-        def yes_no( question ):
-            # raw_input returns the empty string for "enter"
-            yes = set(['yes','y', 'ye', ''])
-            no = set(['no','n'])
-            print question
-            choice = raw_input().lower()
-            if choice in yes:
-               return True
-            elif choice in no:
-               return False
-            else:
-               print "Please respond with 'yes' or 'no'"
-               return None
-        
-        
         while not quit_login:
             try:
                 self.api.login(
@@ -1077,6 +1104,16 @@ class PokemonGoBot(object):
 
         # Start of security, to get various API Versions from different sources
         # Get Official API
+
+        if self.proxy:
+            proxy = urllib2.ProxyHandler({'http': self.proxy, 'https': self.proxy})
+            opener = urllib2.build_opener(proxy)
+            opener.addheaders = [('User-Agent', 'Niantic App')] # Mimic Niantic Software
+            urllib2.install_opener(opener)
+        else:
+            opener = urllib2.build_opener()
+            opener.addheaders = [('User-Agent', 'Niantic App')] # Mimic Niantic Software
+
         link = "https://pgorelease.nianticlabs.com/plfe/version"
         f = urllib2.urlopen(link)
         myfile = f.read()
@@ -1115,15 +1152,19 @@ class PokemonGoBot(object):
                 PGoAPI_version_int = int(PGoAPI_version_tmp)
 
                 if PGoAPI_version_int < officialAPI_int:
-                    self.event_manager.emit(
-                        'security_check',
-                        sender=self,
-                        level='info',
-                        formatted="We have detected a Pokemon API Change. Latest Niantic Version is: {}. Program Exiting...".format(officalAPI)
-                    )
                     yn=None
                     while yn==None:
-                        yn = yes_no("Warning: A new pokemon API version is found. Do you want to keep the bot running on your own risk of loosing your account? Y/N")
+                        if not self.bypass_warning:
+                            yn = self.yes_no("We have detected a Pokemon API Change. Latest Niantic Version is: {}. Do you want to contine? Y/N".format(officalAPI),"security_check")
+                        else:
+                            self.event_manager.emit(
+                                'security_check',
+                                sender=self,
+                                level='info',
+                                formatted="We have detected a Pokemon API Change. Latest Niantic Version is: {}. You have chose to bypass warning, bot will continue running.".format(officalAPI)
+                            )
+                            yn=True
+                            sleep(5)
                     if not yn:
                         sys.exit(1)
                 else:
@@ -1139,6 +1180,9 @@ class PokemonGoBot(object):
     def _setup_api(self):
         # instantiate pgoapi @var ApiWrapper
         self.api = ApiWrapper(config=self.config)
+
+        if self.proxy:
+            self.api.set_proxy({'http': self.proxy, 'https': self.proxy})
 
         # provide player position on the earth
         self._set_starting_position()
@@ -1224,7 +1268,8 @@ class PokemonGoBot(object):
 
         self.logger.info(
             'LuckyEgg: ' + str(items_inventory.get(301).count) +
-            ' | Incubator: ' + str(items_inventory.get(902).count))
+            ' | Incubator Basic: ' + str(items_inventory.get(902).count) +
+            ' | Incubator Super: ' + str(items_inventory.get(903).count))
 
         self.logger.info(
             'Potion: ' + str(items_inventory.get(101).count) +
@@ -1257,13 +1302,21 @@ class PokemonGoBot(object):
 
         if warn:
             self.logger.info('')
-            self.event_manager.emit(
-                'niantic_warning',
-                sender=self,
-                level='warning',
-                formatted="This account has recieved a warning from Niantic. Bot at own risk."
-            )
-            sleep(5) # Pause to allow user to see warning
+            yn=None
+            while yn==None:
+                if not self.bypass_warning:
+                    yn = self.yes_no("This account has recieved a warning from Niantic. Bot at own risk. Do you want to contine? Y/N","niantic_warning")
+                else:
+                    self.event_manager.emit(
+                        'niantic_warning',
+                        sender=self,
+                        level='warning',
+                        formatted="This account has recieved a warning from Niantic. Bot at own risk. You have chose to bypass warning, bot will continue running."
+                    )
+                    yn=True
+                    sleep(5) # Pause to allow user to see warning
+            if not yn:
+                sys.exit(1)
 
         self.logger.info('')
 
@@ -1529,7 +1582,15 @@ class PokemonGoBot(object):
             request = self.api.create_request()
             request.get_player()
             request.check_awarded_badges()
-            request.get_inbox()
+            if self.get_inbox_time==0:
+                request.get_inbox(is_history=True,is_reverse=False)
+            else:
+                request.get_inbox(is_history=True,is_reverse=False,not_before_ms=self.get_inbox_time)
+        
+            # self.get_inbox_time = int(datetime.datetime.now().strftime("%s")) * 1000
+            # More Windows friendly
+            self.get_inbox_time = calendar.timegm(datetime.datetime.now().timetuple())*1000 
+            
             responses = None
             try:
                 responses = request.call()
@@ -1551,62 +1612,67 @@ class PokemonGoBot(object):
                         formatted='player_data: {player_data}',
                         data={'player_data': self._player}
                     )
+
                 if responses['responses']['GET_INBOX']['result'] == 1:
                     self._inbox = responses['responses']['GET_INBOX']['inbox']
                     # self.logger.info("Got inbox messages?")
-                    # self.logger.info("Inbox: %s" % responses['responses']['GET_INBOX'])
+                    # self.logger.info("Inbox: "+format(responses['responses']['GET_INBOX']))
                 if 'notifications' in self._inbox:
                     for notification in self._inbox['notifications']:
                         notification_date = datetime.datetime.fromtimestamp(int(notification['create_timestamp_ms']) / 1e3)
-                        if previous_heartbeat > (int(notification['create_timestamp_ms']) / 1e3):
-                            # Skipp old notifications!
-                            continue
+                                                
+                        if 2 in notification['labels']:
+                            if notification['category'] == 'pokemon_hungry':
+                                gym_name = pokemon = 'Unknown'
+                                for variable in notification['variables']:
+                                    if variable['name'] == 'GYM_NAME':
+                                        gym_name = variable['literal']
+                                    if variable['name'] == 'POKEDEX_ENTRY_NUMBER':
+                                        pokemon_int = int(variable['key'])
+                                        pokemon = Pokemons.name_for(pokemon_int)
+                                    if variable['name'] == 'POKEMON_NICKNAME':
+                                        pokemon = variable['literal']
 
-                        if notification['category'] == 'pokemon_hungry':
-                            gym_name = pokemon = 'Unknown'
-                            for variable in notification['variables']:
-                                if variable['name'] == 'GYM_NAME':
-                                    gym_name = variable['literal']
-                                if variable['name'] == 'POKEMON_NICKNAME':
-                                    pokemon = variable['literal']
+                                self.event_manager.emit(
+                                    'pokemon_hungy',
+                                    sender=self,
+                                    level='info',
+                                    formatted='{pokemon} in the Gym {gym_name} is hungy and want a candy! {notification_date}',
+                                    data={
+                                        'pokemon': pokemon,
+                                        'gym_name': gym_name,
+                                        'notification_date': notification_date.strftime('%Y-%m-%d %H:%M:%S.%f')
+                                    }
+                                )
 
-                            self.event_manager.emit(
-                                'pokemon_hungy',
-                                sender=self,
-                                level='info',
-                                formatted='{pokemon} in the Gym {gym_name} is hungy and want a candy! {notification_date}',
-                                data={
-                                    'pokemon': pokemon,
-                                    'gym_name': gym_name,
-                                    'notification_date': notification_date.strftime('%Y-%m-%d %H:%M:%S.%f')
-                                }
-                            )
+                            if notification['category'] == 'gym_removal':
+                                gym_name = pokemon = 'Unknown'
+                                for variable in notification['variables']:
+                                    if variable['name'] == 'GYM_NAME':
+                                        gym_name = variable['literal']
+                                    if variable['name'] == 'POKEDEX_ENTRY_NUMBER':
+                                        pokemon_int = int(variable['key'])
+                                        pokemon = Pokemons.name_for(pokemon_int)
+                                    if variable['name'] == 'POKEMON_NICKNAME':
+                                        pokemon = variable['literal']
+                                    if variable['name'] == 'POKECOIN_AWARDED':
+                                        coins_awared = variable['literal']
+                                    if variable['name'] == 'POKECOIN_AWARDED_TODAY':
+                                        coins_awared_today = variable['literal']
 
-                        if notification['category'] == 'gym_removal':
-                            gym_name = pokemon = 'Unknown'
-                            for variable in notification['variables']:
-                                if variable['name'] == 'GYM_NAME':
-                                    gym_name = variable['literal']
-                                if variable['name'] == 'POKEMON_NICKNAME':
-                                    pokemon = variable['literal']
-                                if variable['name'] == 'POKECOIN_AWARDED':
-                                    coins_awared = variable['literal']
-                                if variable['name'] == 'POKECOIN_AWARDED_TODAY':
-                                    coins_awared_today = variable['literal']
-
-                            self.event_manager.emit(
-                                'pokemon_knock_out_gym',
-                                sender=self,
-                                level='info',
-                                formatted='{pokemon} has been knocked out the Gym {gym_name} at {notification_date}. Awarded coins: {awarded_coins} | Today awared: {awarded_coins_today}',
-                                data={
-                                    'pokemon': pokemon,
-                                    'gym_name': gym_name,
-                                    'notification_date': notification_date.strftime('%Y-%m-%d %H:%M:%S.%f'),
-                                    'awarded_coins': coins_awared,
-                                    'awarded_coins_today': coins_awared_today
-                                }
-                            )
+                                self.event_manager.emit(
+                                    'pokemon_knock_out_gym',
+                                    sender=self,
+                                    level='info',
+                                    formatted='{pokemon} has been knocked out the Gym {gym_name} at {notification_date}. Awarded coins: {awarded_coins} | Today awared: {awarded_coins_today}',
+                                    data={
+                                        'pokemon': pokemon,
+                                        'gym_name': gym_name,
+                                        'notification_date': notification_date.strftime('%Y-%m-%d %H:%M:%S.%f'),
+                                        'awarded_coins': coins_awared,
+                                        'awarded_coins_today': coins_awared_today
+                                    }
+                                )
 
 
                 if responses['responses']['CHECK_AWARDED_BADGES']['success'] == True:
@@ -1717,8 +1783,12 @@ class PokemonGoBot(object):
             since_timestamp_ms=timestamp,
             cell_id=cellid
         )
-        self.last_map_object = request.call()
-        
+        try:
+            self.last_map_object = request.call()
+        except NotLoggedInException:
+            self.logger.info("Session has expired, re-login....")
+            return
+
         self.emit_forts_event(self.last_map_object)
         #if self.last_map_object:
         #    print self.last_map_object
